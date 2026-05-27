@@ -496,7 +496,7 @@ input[type=range].mini-slider::-moz-range-thumb{width:14px;height:14px;border-ra
     </div>
     <div class="mini-row">
       <span class="mini-label">🔊 VOL</span>
-      <input type="range" class="mini-slider" id="vol-quick" min="0" max="200" value="100"
+      <input type="range" class="mini-slider" id="vol-quick" min="0" max="500" value="100"
         oninput="syncVolQuick(this.value)">
       <span class="mini-val" id="vol-quick-val">100%</span>
     </div>
@@ -522,8 +522,33 @@ input[type=range].mini-slider::-moz-range-thumb{width:14px;height:14px;border-ra
       </div>
       <div class="panel-body open" id="body-dynamics">
         <div class="range-row">
-          <div class="range-head"><span class="range-name">Volume</span><span class="range-val" id="vol-val">100%</span></div>
-          <input type="range" class="hslider" id="vol" min="0" max="200" value="100" oninput="updateDynamics()">
+          <div class="range-head">
+            <span class="range-name">Volume</span>
+            <span class="range-val" id="vol-val">100%</span>
+          </div>
+          <input type="range" class="hslider" id="vol" min="0" max="500" value="100" oninput="updateDynamics()">
+          <div style="display:flex;gap:6px;margin-top:6px;flex-wrap:wrap;">
+            <button class="btn-change" onclick="setVol(100)" title="Normal">100%</button>
+            <button class="btn-change" onclick="setVol(200)" title="2x">200%</button>
+            <button class="btn-change" onclick="setVol(300)" title="3x">300%</button>
+            <button class="btn-change" onclick="setVol(400)" title="4x">400%</button>
+            <button class="btn-change" onclick="setVol(500)" title="5x" style="color:var(--warn);border-color:rgba(255,181,71,0.5);">500% 🔥</button>
+          </div>
+        </div>
+        <div class="range-row" id="extreme-boost-row">
+          <div class="range-head">
+            <span class="range-name" style="color:var(--accent2);">⚡ Boost Extremo</span>
+            <span class="range-val" id="extreme-val" style="color:var(--accent2);">Off</span>
+          </div>
+          <input type="range" class="hslider" id="extreme-boost" min="1" max="10" value="1" step="0.5"
+            oninput="updateExtremeBoost(this.value)"
+            style="--pct:0%;background:linear-gradient(to right,var(--accent2) var(--pct,0%),var(--border2) var(--pct,0%));">
+          <div style="margin-top:6px;font-family:'Space Mono',monospace;font-size:10px;color:var(--text3);">
+            Amplificação em cadeia: até 10× (1000%) com compressão automática
+          </div>
+          <div id="clip-warning" style="display:none;margin-top:6px;padding:6px 10px;background:rgba(255,56,96,0.12);border:1px solid rgba(255,56,96,0.4);border-radius:6px;font-family:'Space Mono',monospace;font-size:10px;color:var(--danger);">
+            ⚠ CLIPPING PROVÁVEL — desative o Limitador para efeito máximo
+          </div>
         </div>
         <div class="range-row">
           <div class="range-head"><span class="range-name">Normalização</span><span class="range-val" id="norm-val">Off</span></div>
@@ -1514,8 +1539,9 @@ function syncSpeedQuick(val) {
 function syncVolQuick(val) {
   document.getElementById('vol-quick-val').textContent = val + '%';
   const mainSlider = document.getElementById('vol');
-  if(mainSlider) { mainSlider.value = val; document.getElementById('vol-val').textContent=val+'%'; }
+  if(mainSlider) { mainSlider.value = val; document.getElementById('vol-val').textContent=val+'%'; updateSliderGradient(mainSlider); }
   updateSliderPct(document.getElementById('vol-quick'));
+  updateVolWarning(parseInt(val));
 }
 
 function updateSliderPct(el) {
@@ -1656,8 +1682,49 @@ function updateFX(){}
 function updateStereo(){}
 
 // ── Value display updates ────────────────────────────
-document.getElementById('vol').addEventListener('input',function(){document.getElementById('vol-val').textContent=this.value+'%';
-  const mq=document.getElementById('vol-quick');if(mq){mq.value=this.value;document.getElementById('vol-quick-val').textContent=this.value+'%';updateSliderPct(mq);}
+function setVol(v) {
+  const el = document.getElementById('vol');
+  el.value = v;
+  updateSliderGradient(el);
+  document.getElementById('vol-val').textContent = v + '%';
+  const mq = document.getElementById('vol-quick');
+  if(mq){mq.value=v;document.getElementById('vol-quick-val').textContent=v+'%';updateSliderPct(mq);}
+  updateVolWarning(v);
+}
+
+function updateExtremeBoost(v) {
+  const val = parseFloat(v);
+  const el = document.getElementById('extreme-boost');
+  const pct = ((val - 1) / 9) * 100;
+  el.style.background = `linear-gradient(to right,var(--accent2) ${pct}%,var(--border2) ${pct}%)`;
+  if(val <= 1) {
+    document.getElementById('extreme-val').textContent = 'Off';
+  } else {
+    document.getElementById('extreme-val').textContent = `${val}× (${Math.round(val*100)}%)`;
+  }
+  const volVal = parseInt(document.getElementById('vol').value);
+  updateVolWarning(volVal);
+}
+
+function updateVolWarning(volPct) {
+  const extreme = parseFloat(document.getElementById('extreme-boost').value);
+  const totalGain = (volPct / 100) * extreme;
+  const warn = document.getElementById('clip-warning');
+  if(totalGain > 2) {
+    warn.style.display = 'block';
+    const db = (20 * Math.log10(totalGain)).toFixed(1);
+    warn.innerHTML = `⚠ CLIPPING PROVÁVEL — ganho total: ${Math.round(totalGain*100)}% (+${db} dB) — desative o Limitador para efeito máximo`;
+  } else {
+    warn.style.display = 'none';
+  }
+}
+
+document.getElementById('vol').addEventListener('input',function(){
+  const v = this.value;
+  document.getElementById('vol-val').textContent = v + '%';
+  const mq=document.getElementById('vol-quick');
+  if(mq){mq.value=v;document.getElementById('vol-quick-val').textContent=v+'%';updateSliderPct(mq);}
+  updateVolWarning(parseInt(v));
 });
 document.getElementById('norm').addEventListener('input',function(){document.getElementById('norm-val').textContent=this.value+'dB';});
 document.getElementById('comp-thresh').addEventListener('input',function(){document.getElementById('comp-thresh-val').textContent=this.value+'dB';});
@@ -1697,13 +1764,16 @@ function updateNoiseEstimate() {
 // ── Reset All ─────────────────────────────────────────
 function resetAll() {
   eqPreset('flat');
-  ['vol','comp-thresh','comp-ratio','comp-attack','comp-release','norm','hp-freq','lp-freq','gate-thresh','deesser','stereo-width','reverb','fade-in','fade-out','speed','pitch','pan','balance'].forEach(id=>{
+  ['vol','comp-thresh','comp-ratio','comp-attack','comp-release','norm','hp-freq','lp-freq','gate-thresh','deesser','stereo-width','reverb','fade-in','fade-out','speed','pitch','pan','balance','extreme-boost'].forEach(id=>{
     const el=document.getElementById(id);
     if(el){el.value=el.defaultValue;updateSliderGradient(el);}
   });
   ['comp-on','limiter-on','hp-on'].forEach(id=>{const el=document.getElementById(id);if(el)el.checked=true;});
   ['norm-on','lp-on','gate-on','deess-on','mono-on','phase-on','swap-on'].forEach(id=>{const el=document.getElementById(id);if(el)el.checked=false;});
   document.getElementById('vol-val').textContent='100%';
+  document.getElementById('extreme-val').textContent='Off';
+  document.getElementById('clip-warning').style.display='none';
+  const eb=document.getElementById('extreme-boost');if(eb){eb.style.background='linear-gradient(to right,var(--accent2) 0%,var(--border2) 0%)';}
   document.getElementById('norm-val').textContent='Off';
   document.getElementById('comp-thresh-val').textContent='-24dB';
   document.getElementById('comp-ratio-val').textContent='4:1';
@@ -1827,10 +1897,38 @@ async function exportAudio() {
       lastNode.connect(lim); lastNode=lim;
     }
 
-    // 9 — Gain / Volume
-    const gainNode=offCtx.createGain();
-    gainNode.gain.value=parseFloat(document.getElementById('vol').value)/100;
-    lastNode.connect(gainNode); lastNode=gainNode;
+    // 9 — Gain / Volume + Extreme Boost
+    const volPct = parseFloat(document.getElementById('vol').value) / 100;
+    const extremeMult = parseFloat(document.getElementById('extreme-boost').value);
+    const totalGain = volPct * extremeMult;
+
+    if(extremeMult > 1 && totalGain > 1) {
+      // Multi-stage gain chain for extreme boost
+      // Stage 1: bring to target with compressor to tame dynamics first
+      const preComp = offCtx.createDynamicsCompressor();
+      preComp.threshold.value = -12;
+      preComp.ratio.value = Math.min(extremeMult * 2, 20);
+      preComp.attack.value = 0.001;
+      preComp.release.value = 0.1;
+      preComp.knee.value = 3;
+      lastNode.connect(preComp); lastNode = preComp;
+
+      // Stage 2: main gain
+      const gainStage1 = offCtx.createGain();
+      gainStage1.gain.value = Math.min(totalGain, 5);
+      lastNode.connect(gainStage1); lastNode = gainStage1;
+
+      // Stage 3: if gain > 5×, add a second gain stage
+      if(totalGain > 5) {
+        const gainStage2 = offCtx.createGain();
+        gainStage2.gain.value = totalGain / 5;
+        lastNode.connect(gainStage2); lastNode = gainStage2;
+      }
+    } else {
+      const gainNode = offCtx.createGain();
+      gainNode.gain.value = totalGain;
+      lastNode.connect(gainNode); lastNode = gainNode;
+    }
 
     lastNode.connect(offCtx.destination);
     src.start(0);
