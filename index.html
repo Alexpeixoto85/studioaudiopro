@@ -1855,271 +1855,83 @@ function setNRStrength(s) {
   document.getElementById('nr-intensity-val').textContent = labels[s];
 }
 
-// Spectral noise reduction using FFT-based spectral subtraction
-function spectralSubtraction(inputData, sampleRate, strength) {
-  const fftSize = 2048;
-  const hopSize = fftSize / 4;
-  const numFrames = Math.floor((inputData.length - fftSize) / hopSize) + 1;
+// Fast spectral noise reduction — processes in chunks with yields to keep UI responsive
+async function spectralSubtraction(inputData, sampleRate, strength, onProgress) {
+  const fftSize = 1024; // smaller = faster
+  const hopSize = fftSize / 2;
   const output = new Float32Array(inputData.length);
-  const windowFn = new Float32Array(fftSize);
-  // Hann window
-  for(let i = 0; i < fftSize; i++) {
-    windowFn[i] = 0.5 * (1 - Math.cos(2 * Math.PI * i / (fftSize - 1)));
-  }
-
-  // Estimate noise profile from first 0.3s
-  const noiseSamples = Math.min(Math.floor(sampleRate * 0.3), inputData.length - fftSize);
-  const noiseProfile = new Float32Array(fftSize / 2);
-  const noiseFrames = Math.floor(noiseSamples / hopSize);
-
-  for(let f = 0; f < noiseFrames && f < 10; f++) {
-    const start = f * hopSize;
-    const real = new Float32Array(fftSize);
-    const imag = new Float32Array(fftSize);
-    for(let i = 0; i < fftSize; i++) {
-      real[i] = (inputData[start + i] || 0) * windowFn[i];
-    }
-    fftInPlace(real, imag, fftSize);
-    for(let i = 0; i < fftSize / 2; i++) {
-      noiseProfile[i] += Math.sqrt(real[i]*real[i] + imag[i]*imag[i]);
-    }
-  }
-  for(let i = 0; i < fftSize / 2; i++) {
-    noiseProfile[i] = (noiseProfile[i] / Math.max(1, noiseFrames)) * strength;
-  }
-
-  // Process frames
   const normWeights = new Float32Array(inputData.length);
-  for(let f = 0; f < numFrames; f++) {
-    const start = f * hopSize;
-    const real = new Float32Array(fftSize);
-    const imag = new Float32Array(fftSize);
-    for(let i = 0; i < fftSize; i++) {
-      real[i] = (inputData[start + i] || 0) * windowFn[i];
-    }
-    fftInPlace(real, imag, fftSize);
-    // Spectral subtraction
-    for(let i = 0; i < fftSize / 2; i++) {
-      const mag = Math.sqrt(real[i]*real[i] + imag[i]*imag[i]);
-      const phase = Math.atan2(imag[i], real[i]);
-      const newMag = Math.max(0.05 * mag, mag - noiseProfile[i]);
-      const ratio = newMag / Math.max(mag, 1e-10);
-      real[i] *= ratio;
-      imag[i] *= ratio;
-      // Mirror
-      if(i > 0 && i < fftSize/2) {
-        real[fftSize-i] = real[i];
-        imag[fftSize-i] = -imag[i];
+
+  // Hann window
+  const win = new Float32Array(fftSize);
+  for(let i = 0; i < fftSize; i++) win[i] = 0.5*(1-Math.cos(2*Math.PI*i/(fftSize-1)));
+
+  // Noise profile from first 0.2s (max 8 frames)
+  const noiseProfile = new Float32Array(fftSize/2);
+  const noiseFrames = Math.min(8, Math.floor((sampleRate*0.2)/hopSize));
+  for(let f=0; f<noiseFrames; f++) {
+    const s = f*hopSize;
+    const re = new Float32Array(fftSize), im = new Float32Array(fftSize);
+    for(let i=0;i<fftSize;i++) re[i]=(inputData[s+i]||0)*win[i];
+    fftInPlace(re,im,fftSize);
+    for(let i=0;i<fftSize/2;i++) noiseProfile[i]+=Math.sqrt(re[i]*re[i]+im[i]*im[i]);
+  }
+  const nf = Math.max(1,noiseFrames);
+  for(let i=0;i<fftSize/2;i++) noiseProfile[i]=(noiseProfile[i]/nf)*strength;
+
+  // Process in chunks of 64 frames, yield between chunks
+  const numFrames = Math.floor((inputData.length-fftSize)/hopSize)+1;
+  const chunkSize = 64;
+  for(let chunkStart=0; chunkStart<numFrames; chunkStart+=chunkSize) {
+    const chunkEnd = Math.min(chunkStart+chunkSize, numFrames);
+    for(let f=chunkStart; f<chunkEnd; f++) {
+      const s = f*hopSize;
+      const re = new Float32Array(fftSize), im = new Float32Array(fftSize);
+      for(let i=0;i<fftSize;i++) re[i]=(inputData[s+i]||0)*win[i];
+      fftInPlace(re,im,fftSize);
+      for(let i=0;i<fftSize/2;i++) {
+        const mag = Math.sqrt(re[i]*re[i]+im[i]*im[i]);
+        if(mag < 1e-10) continue;
+        const newMag = Math.max(0.1*mag, mag-noiseProfile[i]);
+        const ratio = newMag/mag;
+        re[i]*=ratio; im[i]*=ratio;
+        if(i>0&&i<fftSize/2){re[fftSize-i]=re[i];im[fftSize-i]=-im[i];}
+      }
+      ifftInPlace(re,im,fftSize);
+      for(let i=0;i<fftSize&&(s+i)<output.length;i++){
+        output[s+i]+=re[i]*win[i];
+        normWeights[s+i]+=win[i]*win[i];
       }
     }
-    ifftInPlace(real, imag, fftSize);
-    // Overlap-add
-    for(let i = 0; i < fftSize && (start + i) < output.length; i++) {
-      output[start + i] += real[i] * windowFn[i];
-      normWeights[start + i] += windowFn[i] * windowFn[i];
-    }
+    // Yield to browser between chunks
+    if(onProgress) onProgress(chunkEnd/numFrames);
+    await new Promise(r=>setTimeout(r,0));
   }
-  // Normalize
-  for(let i = 0; i < output.length; i++) {
-    if(normWeights[i] > 1e-8) output[i] /= normWeights[i];
-  }
+  for(let i=0;i<output.length;i++) if(normWeights[i]>1e-8) output[i]/=normWeights[i];
   return output;
 }
-
-// Simple radix-2 DIT FFT
-function fftInPlace(re, im, n) {
-  // Bit-reversal
-  let j = 0;
-  for(let i = 1; i < n; i++) {
-    let bit = n >> 1;
-    for(; j & bit; bit >>= 1) j ^= bit;
-    j ^= bit;
-    if(i < j) { let t=re[i];re[i]=re[j];re[j]=t; t=im[i];im[i]=im[j];im[j]=t; }
-  }
-  for(let len = 2; len <= n; len <<= 1) {
-    const ang = -2 * Math.PI / len;
-    const wRe = Math.cos(ang), wIm = Math.sin(ang);
-    for(let i = 0; i < n; i += len) {
-      let curRe = 1, curIm = 0;
-      for(let k = 0; k < len/2; k++) {
-        const uRe=re[i+k], uIm=im[i+k];
-        const vRe=re[i+k+len/2]*curRe - im[i+k+len/2]*curIm;
-        const vIm=re[i+k+len/2]*curIm + im[i+k+len/2]*curRe;
-        re[i+k]=uRe+vRe; im[i+k]=uIm+vIm;
-        re[i+k+len/2]=uRe-vRe; im[i+k+len/2]=uIm-vIm;
-        const newRe=curRe*wRe-curIm*wIm;
-        curIm=curRe*wIm+curIm*wRe; curRe=newRe;
-      }
-    }
-  }
-}
-
-function ifftInPlace(re, im, n) {
-  // Conjugate
-  for(let i=0;i<n;i++) im[i]=-im[i];
-  fftInPlace(re, im, n);
-  for(let i=0;i<n;i++) { re[i]/=n; im[i]=-im[i]/n; }
-}
-
-async function runAutoClean() {
-  if(!originalBuffer) { log('Carregue um áudio primeiro.','err'); return; }
-  const btn = document.getElementById('btn-autoclean');
-  btn.disabled = true; btn.classList.add('working');
-  showProgress(); setProgress(5, 'Analisando perfil de ruído…');
-  await new Promise(r => setTimeout(r, 30));
-
-  try {
-    const sr = originalBuffer.sampleRate;
-    const nCh = originalBuffer.numberOfChannels;
-    const len = originalBuffer.length;
-
-    // Determine noise reduction params by preset + strength
-    const presetParams = {
-      voice:     { hp: 120, lp: 8000, deessFreq: 7000, deessQ: 2.5, deessGain: -8, gateDb: -45 },
-      recording: { hp: 80,  lp: 16000, deessFreq: 7500, deessQ: 2, deessGain: -5, gateDb: -50 },
-      phone:     { hp: 200, lp: 4000,  deessFreq: 3500, deessQ: 3, deessGain: -10, gateDb: -40 },
-      music:     { hp: 40,  lp: 20000, deessFreq: 8000, deessQ: 2, deessGain: -3, gateDb: -60 },
-    };
-    const strengthFactor = { light: 0.8, medium: 1.5, strong: 2.5 };
-    const p = presetParams[cleanPreset] || presetParams.voice;
-    const nrMult = strengthFactor[nrStrength] || 1.5;
-
-    setProgress(15, 'Criando contexto offline…');
-    const offCtx = new OfflineAudioContext(nCh, len, sr);
-    const src = offCtx.createBufferSource();
-    src.buffer = originalBuffer;
-    let lastNode = src;
-
-    // High-pass filter
-    setProgress(20, 'Aplicando filtro high-pass…');
-    const hp = offCtx.createBiquadFilter();
-    hp.type = 'highpass'; hp.frequency.value = p.hp; hp.Q.value = 0.9;
-    lastNode.connect(hp); lastNode = hp;
-
-    // Low-pass filter
-    const lp = offCtx.createBiquadFilter();
-    lp.type = 'lowpass'; lp.frequency.value = p.lp; lp.Q.value = 0.7;
-    lastNode.connect(lp); lastNode = lp;
-
-    // Hum removal (60Hz + harmonics) if enabled
-    if(document.getElementById('clean-hum').checked) {
-      setProgress(25, 'Removendo zumbido elétrico…');
-      [50, 60, 100, 120, 150, 180, 200, 240].forEach(f => {
-        const notch = offCtx.createBiquadFilter();
-        notch.type = 'notch'; notch.frequency.value = f; notch.Q.value = 30;
-        lastNode.connect(notch); lastNode = notch;
-      });
-    }
-
-    // De-esser if enabled
-    if(document.getElementById('clean-deess').checked) {
-      setProgress(30, 'Aplicando de-esser…');
-      const de = offCtx.createBiquadFilter();
-      de.type = 'peaking'; de.frequency.value = p.deessFreq;
-      de.Q.value = p.deessQ; de.gain.value = p.deessGain;
-      lastNode.connect(de); lastNode = de;
-    }
-
-    // Compressor
-    const comp = offCtx.createDynamicsCompressor();
-    comp.threshold.value = -24; comp.ratio.value = 3;
-    comp.attack.value = 0.003; comp.release.value = 0.15; comp.knee.value = 8;
-    lastNode.connect(comp); lastNode = comp;
-
-    lastNode.connect(offCtx.destination);
-    src.start(0);
-
-    setProgress(40, 'Renderizando filtros…');
-    let rendered = await offCtx.startRendering();
-
-    // Spectral subtraction for hiss removal
-    if(document.getElementById('clean-hiss').checked) {
-      setProgress(55, 'Subtração espectral de chiados…');
-      await new Promise(r => setTimeout(r, 20));
-      const newBuf = new AudioBuffer({
-        numberOfChannels: rendered.numberOfChannels,
-        length: rendered.length,
-        sampleRate: rendered.sampleRate
-      });
-      for(let c = 0; c < rendered.numberOfChannels; c++) {
-        const inData = rendered.getChannelData(c);
-        const outData = spectralSubtraction(inData, sr, nrMult);
-        newBuf.getChannelData(c).set(outData);
-      }
-      rendered = newBuf;
-    }
-
-    // Noise gate
-    if(document.getElementById('clean-gate').checked) {
-      setProgress(70, 'Aplicando noise gate…');
-      rendered = applyGate(rendered, p.gateDb);
-    }
-
-    // Normalize
-    if(document.getElementById('clean-normalize').checked) {
-      setProgress(80, 'Normalizando…');
-      rendered = normalizeBuffer(rendered, -3);
-    }
-
-    cleanedBuffer = rendered;
-    trimStart = 0;
-    trimEnd = cleanedBuffer.duration;
-    drawWaveform();
-
-    setProgress(100, 'Limpeza concluída!');
-    const resultEl = document.getElementById('clean-result');
-    resultEl.textContent = `✓ Áudio limpo! Redução de chiados aplicada com preset "${cleanPreset}" (intensidade: ${nrStrength}). Use Exportar para salvar.`;
-    resultEl.classList.add('visible');
-    log('✓ Limpeza automática concluída.', 'ok');
-
-  } catch(e) {
-    log('Erro na limpeza: '+e.message, 'err');
-    console.error(e);
-  }
-
-  hideProgress();
-  btn.disabled = false; btn.classList.remove('working');
-}
-
-// ══════════════════════════════════════════════════════
-//  VOICE SEPARATION / DIARIZATION — NEW
-// ══════════════════════════════════════════════════════
-
-// Compute RMS energy of a segment
-function computeRMS(data, start, end) {
-  let sum = 0;
-  for(let i = start; i < end && i < data.length; i++) sum += data[i]*data[i];
-  return Math.sqrt(sum / (end - start));
-}
-
-// Compute zero crossing rate (correlates with pitch/voiced)
-function computeZCR(data, start, end) {
-  let zcr = 0;
-  for(let i = start+1; i < end && i < data.length; i++) {
-    if((data[i] >= 0) !== (data[i-1] >= 0)) zcr++;
-  }
-  return zcr / (end - start);
-}
-
-// Estimate fundamental frequency via autocorrelation
+// Fast pitch estimate via downsampled autocorrelation
 function estimatePitch(data, start, end, sampleRate) {
-  const frameLen = Math.min(end - start, 1024);
-  const minLag = Math.floor(sampleRate / 400); // max 400Hz
-  const maxLag = Math.floor(sampleRate / 60);  // min 60Hz
-  let bestLag = 0, bestCorr = -1;
-  for(let lag = minLag; lag <= maxLag && lag < frameLen; lag++) {
-    let corr = 0;
-    for(let i = 0; i < frameLen - lag; i++) {
-      corr += (data[start+i]||0) * (data[start+i+lag]||0);
-    }
-    if(corr > bestCorr) { bestCorr = corr; bestLag = lag; }
+  // Downsample 4x for speed
+  const step = 4;
+  const frameLen = Math.min(Math.floor((end - start)/step), 256);
+  const sr2 = sampleRate/step;
+  const minLag = Math.floor(sr2/400);
+  const maxLag = Math.floor(sr2/60);
+  const buf = new Float32Array(frameLen);
+  for(let i=0;i<frameLen;i++) buf[i]=data[start+i*step]||0;
+  let bestLag=0, bestCorr=-1;
+  for(let lag=minLag; lag<=maxLag&&lag<frameLen; lag++) {
+    let corr=0;
+    for(let i=0;i<frameLen-lag;i++) corr+=buf[i]*buf[i+lag];
+    if(corr>bestCorr){bestCorr=corr;bestLag=lag;}
   }
-  return bestLag > 0 ? sampleRate / bestLag : 0;
+  return bestLag>0 ? sr2/bestLag : 0;
 }
 
 // Extract spectral centroid
 function computeSpectralCentroid(data, start, frameLen, sampleRate) {
-  const n = Math.min(frameLen, 512);
+  const n = Math.min(frameLen, 256); // smaller FFT for speed
   const re = new Float32Array(n), im = new Float32Array(n);
   for(let i = 0; i < n; i++) re[i] = data[start+i] || 0;
   fftInPlace(re, im, n);
@@ -2165,17 +1977,18 @@ async function runVoiceSeparation() {
     const maxSpk = parseInt(document.getElementById('max-speakers').value);
     const sensitivity = document.getElementById('sep-sensitivity').value;
 
-    const frameMs = 25;  // 25ms frames
-    const hopMs = 10;    // 10ms hop
+    const frameMs = 50;  // 50ms frames — larger = fewer frames = much faster
+    const hopMs = 25;    // 25ms hop
     const frameSamples = Math.floor(sr * frameMs / 1000);
     const hopSamples = Math.floor(sr * hopMs / 1000);
     const numFrames = Math.floor((data.length - frameSamples) / hopSamples);
 
     setProgress(20, 'Extraindo características…');
-    await new Promise(r => setTimeout(r, 20));
+    await new Promise(r => setTimeout(r, 0));
 
-    // Extract features per frame
+    // Extract features per frame — yield every 200 frames to keep UI alive
     const features = [];
+    const yieldEvery = 200;
     for(let f = 0; f < numFrames; f++) {
       const start = f * hopSamples;
       const end = start + frameSamples;
@@ -2185,6 +1998,11 @@ async function runVoiceSeparation() {
       const sc = computeSpectralCentroid(data, start, frameSamples, sr);
       const isSilence = rms < 0.005;
       features.push({ rms, zcr, pitch, sc, isSilence, time: start/sr });
+      if(f % yieldEvery === 0) {
+        const pct = 20 + Math.round((f/numFrames)*20);
+        setProgress(pct, 'Extraindo características… '+Math.round(f/numFrames*100)+'%');
+        await new Promise(r=>setTimeout(r,0));
+      }
     }
 
     setProgress(45, 'Agrupando vozes (clustering)…');
