@@ -1855,6 +1855,146 @@ function setNRStrength(s) {
   document.getElementById('nr-intensity-val').textContent = labels[s];
 }
 
+// ── Audio analysis helpers ────────────────────────────
+function computeRMS(data, start, end) {
+  let sum = 0;
+  const len = Math.min(end, data.length) - start;
+  for(let i = start; i < end && i < data.length; i++) sum += data[i]*data[i];
+  return Math.sqrt(sum / Math.max(1, len));
+}
+
+function computeZCR(data, start, end) {
+  let zcr = 0;
+  for(let i = start+1; i < end && i < data.length; i++) {
+    if((data[i] >= 0) !== (data[i-1] >= 0)) zcr++;
+  }
+  return zcr / Math.max(1, end - start);
+}
+
+// ══════════════════════════════════════════════════════
+//  AUTO CLEAN — MAIN FUNCTION
+// ══════════════════════════════════════════════════════
+async function runAutoClean() {
+  if(!originalBuffer) { log('Carregue um áudio primeiro.','err'); return; }
+  const btn = document.getElementById('btn-autoclean');
+  btn.disabled = true; btn.classList.add('working');
+  showProgress(); setProgress(5, 'Analisando perfil de ruído…');
+  await new Promise(r => setTimeout(r, 30));
+
+  try {
+    const sr = originalBuffer.sampleRate;
+    const nCh = originalBuffer.numberOfChannels;
+    const len = originalBuffer.length;
+
+    const presetParams = {
+      voice:     { hp: 120, lp: 8000,  deessFreq: 7000, deessQ: 2.5, deessGain: -8,  gateDb: -45 },
+      recording: { hp: 80,  lp: 16000, deessFreq: 7500, deessQ: 2,   deessGain: -5,  gateDb: -50 },
+      phone:     { hp: 200, lp: 4000,  deessFreq: 3500, deessQ: 3,   deessGain: -10, gateDb: -40 },
+      music:     { hp: 40,  lp: 20000, deessFreq: 8000, deessQ: 2,   deessGain: -3,  gateDb: -60 },
+    };
+    const strengthFactor = { light: 0.8, medium: 1.5, strong: 2.5 };
+    const p = presetParams[cleanPreset] || presetParams.voice;
+    const nrMult = strengthFactor[nrStrength] || 1.5;
+
+    setProgress(15, 'Criando contexto offline…');
+    const offCtx = new OfflineAudioContext(nCh, len, sr);
+    const src = offCtx.createBufferSource();
+    src.buffer = originalBuffer;
+    let lastNode = src;
+
+    // High-pass filter
+    setProgress(20, 'Aplicando filtros…');
+    const hp = offCtx.createBiquadFilter();
+    hp.type = 'highpass'; hp.frequency.value = p.hp; hp.Q.value = 0.9;
+    lastNode.connect(hp); lastNode = hp;
+
+    // Low-pass filter
+    const lp = offCtx.createBiquadFilter();
+    lp.type = 'lowpass'; lp.frequency.value = p.lp; lp.Q.value = 0.7;
+    lastNode.connect(lp); lastNode = lp;
+
+    // Hum removal if enabled
+    if(document.getElementById('clean-hum').checked) {
+      setProgress(25, 'Removendo zumbido elétrico…');
+      [50, 60, 100, 120, 150, 180, 200, 240].forEach(f => {
+        const notch = offCtx.createBiquadFilter();
+        notch.type = 'notch'; notch.frequency.value = f; notch.Q.value = 30;
+        lastNode.connect(notch); lastNode = notch;
+      });
+    }
+
+    // De-esser if enabled
+    if(document.getElementById('clean-deess').checked) {
+      const de = offCtx.createBiquadFilter();
+      de.type = 'peaking'; de.frequency.value = p.deessFreq;
+      de.Q.value = p.deessQ; de.gain.value = p.deessGain;
+      lastNode.connect(de); lastNode = de;
+    }
+
+    // Light compressor to tame dynamics
+    const comp = offCtx.createDynamicsCompressor();
+    comp.threshold.value = -24; comp.ratio.value = 3;
+    comp.attack.value = 0.003; comp.release.value = 0.15; comp.knee.value = 8;
+    lastNode.connect(comp); lastNode = comp;
+
+    lastNode.connect(offCtx.destination);
+    src.start(0);
+
+    setProgress(40, 'Renderizando filtros…');
+    let rendered = await offCtx.startRendering();
+
+    // Spectral subtraction for hiss removal
+    if(document.getElementById('clean-hiss').checked) {
+      setProgress(55, 'Removendo chiados (subtração espectral)…');
+      await new Promise(r => setTimeout(r, 0));
+      const newBuf = new AudioBuffer({
+        numberOfChannels: rendered.numberOfChannels,
+        length: rendered.length,
+        sampleRate: rendered.sampleRate
+      });
+      for(let c = 0; c < rendered.numberOfChannels; c++) {
+        const inData = rendered.getChannelData(c);
+        const outData = await spectralSubtraction(inData, sr, nrMult, (prog) => {
+          setProgress(55 + Math.round(prog * 15), 'Removendo chiados… ' + Math.round(prog*100) + '%');
+        });
+        newBuf.getChannelData(c).set(outData);
+      }
+      rendered = newBuf;
+    }
+
+    // Noise gate
+    if(document.getElementById('clean-gate').checked) {
+      setProgress(75, 'Aplicando noise gate…');
+      rendered = applyGate(rendered, p.gateDb);
+    }
+
+    // Normalize
+    if(document.getElementById('clean-normalize').checked) {
+      setProgress(85, 'Normalizando…');
+      rendered = normalizeBuffer(rendered, -3);
+    }
+
+    cleanedBuffer = rendered;
+    trimStart = 0;
+    trimEnd = cleanedBuffer.duration;
+    drawWaveform();
+
+    setProgress(100, 'Limpeza concluída!');
+    const resultEl = document.getElementById('clean-result');
+    resultEl.textContent = '✓ Áudio limpo! Preset: "' + cleanPreset + '" · Intensidade: ' + nrStrength + '. Use Exportar para salvar.';
+    resultEl.classList.add('visible');
+    log('✓ Limpeza automática concluída.', 'ok');
+
+  } catch(e) {
+    log('Erro na limpeza: ' + e.message, 'err');
+    console.error(e);
+  }
+
+  hideProgress();
+  btn.disabled = false; btn.classList.remove('working');
+}
+
+
 // Fast spectral noise reduction — processes in chunks with yields to keep UI responsive
 async function spectralSubtraction(inputData, sampleRate, strength, onProgress) {
   const fftSize = 1024; // smaller = faster
